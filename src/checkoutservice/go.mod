@@ -13,6 +13,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.35.0
 	google.golang.org/grpc v1.71.0
 	google.golang.org/protobuf v1.36.6
+	github.com/jackc/pgx/v5 v5.7.4
 )
 
 require (
