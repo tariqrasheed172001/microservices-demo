@@ -81,6 +81,8 @@ type checkoutService struct {
 
 	paymentSvcAddr string
 	paymentSvcConn *grpc.ClientConn
+
+	orderRepo *OrderRepository
 }
 
 func main() {
@@ -118,7 +120,14 @@ func main() {
 	mustConnGRPC(ctx, &svc.cartSvcConn, svc.cartSvcAddr)
 	mustConnGRPC(ctx, &svc.currencySvcConn, svc.currencySvcAddr)
 	mustConnGRPC(ctx, &svc.emailSvcConn, svc.emailSvcAddr)
-	mustConnGRPC(ctx, &svc.paymentSvcConn, svc.paymentSvcAddr)
+    mustConnGRPC(ctx, &svc.paymentSvcConn, svc.paymentSvcAddr)
+
+	// Initialize order persistence repository (Postgres)
+	repo, err := NewOrderRepository(ctx)
+	if err != nil {
+		log.Fatalf("failed to initialize order repository: %v", err)
+	}
+	svc.orderRepo = repo
 
 	log.Infof("service config: %+v", svc)
 
@@ -248,13 +257,13 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		total = money.Must(money.Sum(total, multPrice))
 	}
 
-	txID, err := cs.chargeCard(ctx, &total, req.CreditCard)
+    txID, err := cs.chargeCard(ctx, &total, req.CreditCard)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to charge card: %+v", err)
 	}
 	log.Infof("payment went through (transaction_id: %s)", txID)
 
-	shippingTrackingID, err := cs.shipOrder(ctx, req.Address, prep.cartItems)
+    shippingTrackingID, err := cs.shipOrder(ctx, req.Address, prep.cartItems)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "shipping error: %+v", err)
 	}
@@ -268,6 +277,36 @@ func (cs *checkoutService) PlaceOrder(ctx context.Context, req *pb.PlaceOrderReq
 		ShippingAddress:    req.Address,
 		Items:              prep.orderItems,
 	}
+
+    // Persist order
+    if cs.orderRepo != nil {
+        addrJSON, err := marshalToJSON(orderResult.ShippingAddress)
+        if err != nil {
+            log.Warnf("failed to marshal shipping address: %v", err)
+        }
+        itemsJSON, err := marshalToJSON(orderResult.Items)
+        if err != nil {
+            log.Warnf("failed to marshal items: %v", err)
+        }
+        rec := OrderRecord{
+            OrderID:             orderResult.OrderId,
+            UserID:              req.UserId,
+            Email:               req.Email,
+            CurrencyCode:        req.UserCurrency,
+            TotalUnits:          total.Units,
+            TotalNanos:          total.Nanos,
+            PaymentTransaction:  txID,
+            ShippingTrackingID:  shippingTrackingID,
+            ShippingAddressJSON: addrJSON,
+            ItemsJSON:           itemsJSON,
+            CreatedAt:           time.Now(),
+        }
+        if err := cs.orderRepo.SaveOrder(ctx, rec); err != nil {
+            log.Warnf("failed to persist order: %v", err)
+        } else {
+            log.Infof("order %s persisted to database", orderResult.OrderId)
+        }
+    }
 
 	if err := cs.sendOrderConfirmation(ctx, req.Email, orderResult); err != nil {
 		log.Warnf("failed to send order confirmation to %q: %+v", req.Email, err)
